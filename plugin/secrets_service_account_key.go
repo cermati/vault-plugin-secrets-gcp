@@ -182,11 +182,11 @@ func (b *backend) secretKeyRevoke(ctx context.Context, req *logical.Request, d *
 	item.Counter--
 
 	if item.Counter == 0 {
-		delete(cacheCollection.Items, keyName)
+		cacheCollection.deleteItem(keyName)
 	}
 
 	if err := cacheCollection.putToStorage(ctx, req.Storage, rolesetName); err != nil {
-		return logical.ErrorResponse(err.Error()), nil
+		return logical.ErrorResponse(fmt.Sprintf("unable to update the cache collection storage: %s", err.Error())), nil
 	}
 
 	if item.Counter > 0 {
@@ -240,7 +240,7 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 	b.saCacheLock.Lock()
 	defer b.saCacheLock.Unlock()
 
-	b.Logger().Info("trying to get cache collection", "roleset", rs.Name)
+	b.Logger().Debug("trying to get cache collection", "roleset", rs.Name)
 	validCacheItem, err := getSecretKeyFromCache(ctx, s, rs)
 	if err != nil {
 		b.Logger().Error("failed to get service account key from cache", "roleset_name", rs.Name, "err", err.Error())
@@ -260,7 +260,7 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 		return resp, nil
 	}
 
-	b.Logger().Info("no service account key cache collection found", "roleset_name", rs.Name)
+	b.Logger().Debug("a new service account will be created", "roleset_name", rs.Name)
 
 	iamC, err := b.IAMAdminClient(s)
 	if err != nil {
@@ -281,8 +281,15 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	if err := createCacheCollection(ctx, s, rs, key, ttlToUse); err != nil {
-		b.Logger().Error("failed to create a new service account key cache collection", "roleset_name", rs.Name, "err", err.Error())
+	if cacheCreationErr := createCacheCollection(ctx, s, rs, key, ttlToUse); cacheCreationErr != nil {
+		baseErrResp := fmt.Sprintf("failed to save the new service account key cache collection: %s;", cacheCreationErr.Error())
+
+		_, err = iamC.Projects.ServiceAccounts.Keys.Delete(key.Name).Do()
+		if err != nil && !isGoogleAccountKeyNotFoundErr(err) {
+			return logical.ErrorResponse(fmt.Sprintf("%s unable to rollback service account key %s: %s", baseErrResp, key.Name, err.Error())), nil
+		}
+
+		return logical.ErrorResponse(fmt.Sprintf("%s service account key has been rolled back.", baseErrResp)), nil
 	}
 
 	secretD := map[string]interface{}{
@@ -320,20 +327,23 @@ func getSecretKeyFromCache(ctx context.Context, s logical.Storage, rs *RoleSet) 
 		return nil, errwrap.Wrapf("could not get service account key cache collection: {{err}}", err)
 	}
 
-	if cacheCollection != nil {
-		_, validCacheItem := cacheCollection.getFirstValidItem(rs.bindingHash())
-		if validCacheItem != nil {
-			validCacheItem.Counter++
-
-			if err := cacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
-				return nil, errwrap.Wrapf("failed to update cache key collection: {{err}}", err)
-			}
-
-			return validCacheItem, nil
-		}
+	if cacheCollection == nil {
+		return nil, nil
 	}
 
-	return nil, nil
+	_, validCacheItem := cacheCollection.getFirstValidItem(rs.bindingHash())
+	if validCacheItem == nil {
+		return nil, nil
+	}
+
+	validCacheItem.Counter++
+
+	if err := cacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
+		return nil, errwrap.Wrapf("failed to update cache key collection: {{err}}", err)
+	}
+
+	return validCacheItem, nil
+
 }
 
 func createCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, key *iam.ServiceAccountKey, ttl time.Duration) error {
@@ -372,15 +382,15 @@ func getCacheCollection(ctx context.Context, s logical.Storage, keyName string) 
 	}
 
 	if cachedKeyCollection != nil {
-		decodedCollection := new(serviceAccountKeyCacheCollection)
-		if err := cachedKeyCollection.DecodeJSON(decodedCollection); err != nil {
-			return nil, err
-		}
-
-		return decodedCollection, nil
+		return nil, nil
 	}
 
-	return nil, nil
+	decodedCollection := new(serviceAccountKeyCacheCollection)
+	if err := cachedKeyCollection.DecodeJSON(decodedCollection); err != nil {
+		return nil, err
+	}
+
+	return decodedCollection, nil
 }
 
 const pathServiceAccountKeySyn = `Generate an service account private key under a specific role set.`
@@ -441,6 +451,10 @@ func (c *serviceAccountKeyCacheCollection) putToStorage(ctx context.Context, s l
 	}
 
 	return nil
+}
+
+func (c *serviceAccountKeyCacheCollection) deleteItem(keyName string) {
+	delete(c.Items, keyName)
 }
 
 type serviceAccountKeyCacheItem struct {
