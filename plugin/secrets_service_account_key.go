@@ -381,7 +381,7 @@ func getCacheCollection(ctx context.Context, s logical.Storage, keyName string) 
 		return nil, err
 	}
 
-	if cachedKeyCollection != nil {
+	if cachedKeyCollection == nil {
 		return nil, nil
 	}
 
