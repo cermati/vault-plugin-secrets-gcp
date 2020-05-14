@@ -2,6 +2,7 @@ package gcpsecrets
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -331,7 +332,7 @@ func getSecretKeyFromCache(ctx context.Context, s logical.Storage, rs *RoleSet) 
 		return nil, nil
 	}
 
-	_, validCacheItem := cacheCollection.getFirstValidItem(rs.bindingHash())
+	_, validCacheItem := cacheCollection.getLatestItem(rs.bindingHash())
 	if validCacheItem == nil {
 		return nil, nil
 	}
@@ -366,7 +367,11 @@ func createCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, 
 		Counter:            1,
 	}
 
-	newCacheCollection := newServiceAccountKeyCacheCollection(newCacheItem, key.Name)
+	newCacheCollection := newServiceAccountKeyCacheCollection()
+
+	if err := newCacheCollection.putItem(key.Name, newCacheItem); err != nil {
+		return errwrap.Wrapf("failed to put new item into cache collection: {{err}}", err)
+	}
 
 	if err := newCacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
 		return errwrap.Wrapf("failed to insert new cache collection into storage: {{err}}", err)
@@ -408,23 +413,39 @@ type serviceAccountKeyCacheCollection struct {
 	Items map[string]*serviceAccountKeyCacheItem
 }
 
-func newServiceAccountKeyCacheCollection(item *serviceAccountKeyCacheItem, itemKey string) *serviceAccountKeyCacheCollection {
+func newServiceAccountKeyCacheCollection() *serviceAccountKeyCacheCollection {
 	cacheCollection := new(serviceAccountKeyCacheCollection)
 	cacheCollection.Items = make(map[string]*serviceAccountKeyCacheItem)
-
-	if item != nil && itemKey != "" {
-		cacheCollection.Items[itemKey] = item
-	}
 
 	return cacheCollection
 }
 
-func (c *serviceAccountKeyCacheCollection) getFirstValidItem(rsBindingHash string) (string, *serviceAccountKeyCacheItem) {
+func (c *serviceAccountKeyCacheCollection) putItem(itemKey string, item *serviceAccountKeyCacheItem) error {
+	if itemKey == "" {
+		return errors.New("Item key can't be empty")
+	}
+
+	if item == nil {
+		return errors.New("Item can't be nil")
+	}
+
+	c.Items[itemKey] = item
+
+	return nil
+}
+
+func (c *serviceAccountKeyCacheCollection) getLatestItem(rsBindingHash string) (string, *serviceAccountKeyCacheItem) {
+	// Keys element format:
+	// projects/<project_id>/serviceAccounts/vault<shorten_roleset_name>-<timestamp>@<project_id>.iam.gserviceaccount.com/keys/<key_id>
+	// Example:
+	// projects/infrastructure-260106/serviceAccounts/vaulttestproduct-te-1589452997@infrastructure-260106.iam.gserviceaccount.com/keys/471b62bd4b2ea968384f66c4d0fa8f91fbf4c61b
+
 	keys := make([]string, 0, len(c.Items))
 	for k := range c.Items {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+
+	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
 
 	for _, key := range keys {
 		item := c.Items[key]
