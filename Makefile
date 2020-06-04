@@ -73,4 +73,4 @@ cermati-publish-s3: cermati-bin
 	aws --profile cermati s3 cp --recursive --exclude "*" --include "*.zip" pkg/ s3://com.cermati.infra.build.artifacts/vault-plugin/gcp-cermati/v$(VERSION)-release/
 # =============================================================================
 
-.PHONY: bin default generate test vet bootstrap fmt fmtcheck update-resources
+.PHONY: bin default generate test vet bootstrap fmt fmtcheck update-resources cermati-devserver cermati-bin cermati-publish-s3
