@@ -67,7 +67,7 @@ cermati-devserver:
 
 # bin generates the releaseable binaries for this plugin
 cermati-bin: fmtcheck generate
-	@CGO_ENABLED=0 BUILD_TAGS='$(BUILD_TAGS)' sh -c "'$(CURDIR)/scripts/cermati-build.sh'"
+	@CGO_ENABLED=0 BUILD_TAGS='$(BUILD_TAGS)' XC_ARCH=amd64 XC_OS=linux XC_OSARCH=linux/amd64 sh -c "'$(CURDIR)/scripts/build.sh'"
 
 cermati-publish-s3: cermati-bin
 	aws --profile cermati s3 cp --recursive --exclude "*" --include "*.zip" pkg/ s3://com.cermati.infra.build.artifacts/vault-plugin/gcp-cermati/v$(VERSION)-release/
