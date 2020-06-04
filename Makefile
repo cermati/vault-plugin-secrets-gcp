@@ -23,9 +23,6 @@ dev: fmtcheck generate
 dev-dynamic: generate
 	@CGO_ENABLED=1 BUILD_TAGS='$(BUILD_TAGS)' VAULT_DEV_BUILD=1 sh -c "'$(CURDIR)/scripts/build.sh'"
 
-devserver:
-	@sh -c "/opt/vault/bin/vault server -dev -dev-root-token-id=root -dev-plugin-dir=./bin"
-
 testcompile: fmtcheck generate
 	@for pkg in $(TEST) ; do \
 		go test -v -c -tags='$(BUILD_TAGS)' $$pkg -parallel=4 ; \
@@ -60,6 +57,20 @@ update-resources:
 	./generate && \
 	rm generate && \
 	popd
-	
+
+# =============================================================================
+# Cermati specific command
+# =============================================================================
+VERSION := $(shell cat version)
+cermati-devserver:
+	@sh -c "/opt/vault/bin/vault server -dev -dev-root-token-id=root -dev-plugin-dir=./bin"
+
+# bin generates the releaseable binaries for this plugin
+cermati-bin: fmtcheck generate
+	@CGO_ENABLED=0 BUILD_TAGS='$(BUILD_TAGS)' sh -c "'$(CURDIR)/scripts/cermati-build.sh'"
+
+cermati-publish-s3: cermati-bin
+	aws --profile cermati s3 cp --recursive --exclude "*" --include "*.zip" pkg/ s3://com.cermati.infra.build.artifacts/vault-plugin/gcp-cermati/v$(VERSION)-release/
+# =============================================================================
 
 .PHONY: bin default generate test vet bootstrap fmt fmtcheck update-resources
