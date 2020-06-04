@@ -62,7 +62,7 @@ func pathSecretServiceAccountKey(b *backend) *framework.Path {
 				Description: fmt.Sprintf(`Private key type for service account key - defaults to %s"`, privateKeyTypeJson),
 				Default:     privateKeyTypeJson,
 			},
-			"ttl": &framework.FieldSchema{
+			"ttl": {
 				Type:        framework.TypeDurationSecond,
 				Description: "Lifetime of the service account key",
 			},

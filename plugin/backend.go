@@ -33,7 +33,7 @@ type backend struct {
 	// cache directly.
 	cache *cache.Cache
 
-	iamResources iamutil.IamResourceParser
+	resources iamutil.ResourceParser
 
 	rolesetLock sync.Mutex
 
@@ -51,8 +51,8 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 
 func Backend() *backend {
 	var b = &backend{
-		cache:        cache.New(),
-		iamResources: iamutil.GetEnabledIamResources(),
+		cache:     cache.New(),
+		resources: iamutil.GetEnabledResources(),
 	}
 
 	b.Backend = &framework.Backend{
