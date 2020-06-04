@@ -36,6 +36,8 @@ type backend struct {
 	iamResources iamutil.IamResourceParser
 
 	rolesetLock sync.Mutex
+
+	saCacheLock sync.Mutex
 }
 
 // Factory returns a new backend as logical.Backend.

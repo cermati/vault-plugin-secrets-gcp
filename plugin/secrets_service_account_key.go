@@ -2,7 +2,9 @@ package gcpsecrets
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/hashicorp/errwrap"
@@ -15,6 +17,8 @@ const (
 	SecretTypeKey      = "service_account_key"
 	keyAlgorithmRSA2k  = "KEY_ALG_RSA_2048"
 	privateKeyTypeJson = "TYPE_GOOGLE_CREDENTIALS_FILE"
+
+	defaultCacheTTL = time.Duration(3) * time.Hour
 )
 
 func secretServiceAccountKey(b *backend) *framework.Secret {
@@ -159,6 +163,53 @@ func (b *backend) secretKeyRevoke(ctx context.Context, req *logical.Request, d *
 	if !ok {
 		return nil, fmt.Errorf("secret is missing key_name internal data")
 	}
+	keyName := keyNameRaw.(string)
+
+	rolesetNameRaw, ok := req.Secret.InternalData["role_set"]
+	if !ok {
+		return nil, fmt.Errorf("secret is missing role_set internal data")
+	}
+	rolesetName := rolesetNameRaw.(string)
+
+	b.saCacheLock.Lock()
+	defer b.saCacheLock.Unlock()
+
+	cacheCollection, err := getCacheCollection(ctx, req.Storage, rolesetName)
+	if err != nil {
+		return logical.ErrorResponse(fmt.Sprintf("unable to get service account key cache collection of role %s: %v", rolesetName, err)), nil
+	}
+
+	item := cacheCollection.Items[keyName]
+	item.Counter--
+
+	if item.Counter == 0 {
+		cacheCollection.deleteItem(keyName)
+	}
+
+	if err := cacheCollection.putToStorage(ctx, req.Storage, rolesetName); err != nil {
+		return logical.ErrorResponse(fmt.Sprintf("unable to update the cache collection storage: %s", err.Error())), nil
+	}
+
+	if item.Counter > 0 {
+		b.Logger().Debug(
+			"reducing service account key counter",
+			"roleset", rolesetName,
+			"updated_num_user", item.Counter,
+			"cache_key", item.Name,
+			"cache_issue_time", item.IssueTime.Format(time.RFC3339),
+			"cache_ttl", item.TTL.Seconds(),
+		)
+		return nil, nil
+	}
+
+	b.Logger().Debug(
+		"deleting service account key as it has no more referee...",
+		"roleset", rolesetName,
+		"updated_num_user", item.Counter,
+		"cache_key", item.Name,
+		"cache_issue_time", item.IssueTime.Format(time.RFC3339),
+		"cache_ttl", item.TTL.Seconds(),
+	)
 
 	iamAdmin, err := b.IAMAdminClient(req.Storage)
 	if err != nil {
@@ -182,6 +233,36 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 		cfg = &config{}
 	}
 
+	ttlToUse := cfg.TTL
+	if ttl > 0 {
+		ttlToUse = time.Duration(ttl) * time.Second
+	}
+
+	b.saCacheLock.Lock()
+	defer b.saCacheLock.Unlock()
+
+	b.Logger().Debug("trying to get cache collection", "roleset", rs.Name)
+	validCacheItem, err := getSecretKeyFromCache(ctx, s, rs)
+	if err != nil {
+		b.Logger().Error("failed to get service account key from cache", "roleset_name", rs.Name, "err", err.Error())
+	}
+
+	if validCacheItem != nil && err == nil {
+		b.Logger().Debug(
+			"service account key cache item found",
+			"roleset", rs.Name,
+			"updated_num_user", validCacheItem.Counter,
+			"cache_key", validCacheItem.Name,
+			"cache_issue_time", validCacheItem.IssueTime.Format(time.RFC3339),
+			"cache_ttl", validCacheItem.TTL.Seconds(),
+		)
+
+		resp := b.constructRespFromCache(validCacheItem, ttlToUse, cfg.MaxTTL)
+		return resp, nil
+	}
+
+	b.Logger().Debug("a new service account will be created", "roleset_name", rs.Name)
+
 	iamC, err := b.IAMAdminClient(s)
 	if err != nil {
 		return nil, errwrap.Wrapf("could not create IAM Admin client: {{err}}", err)
@@ -201,6 +282,17 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
+	if cacheCreationErr := createCacheCollection(ctx, s, rs, key, ttlToUse); cacheCreationErr != nil {
+		baseErrResp := fmt.Sprintf("failed to save the new service account key cache collection: %s;", cacheCreationErr.Error())
+
+		_, err = iamC.Projects.ServiceAccounts.Keys.Delete(key.Name).Do()
+		if err != nil && !isGoogleAccountKeyNotFoundErr(err) {
+			return logical.ErrorResponse(fmt.Sprintf("%s unable to rollback service account key %s: %s", baseErrResp, key.Name, err.Error())), nil
+		}
+
+		return logical.ErrorResponse(fmt.Sprintf("%s service account key has been rolled back.", baseErrResp)), nil
+	}
+
 	secretD := map[string]interface{}{
 		"private_key_data": key.PrivateKeyData,
 		"key_algorithm":    key.KeyAlgorithm,
@@ -213,13 +305,97 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 	}
 
 	resp := b.Secret(SecretTypeKey).Response(secretD, internalD)
-	resp.Secret.Renewable = true
-
-	if ttl > 0 {
-		resp.Secret.TTL = time.Duration(ttl) * time.Second
-	}
+	resp.Secret.Renewable = false
+	resp.Secret.MaxTTL = cfg.MaxTTL
+	resp.Secret.TTL = ttlToUse
 
 	return resp, nil
+}
+
+func (b *backend) constructRespFromCache(item *serviceAccountKeyCacheItem, ttl, maxTTL time.Duration) *logical.Response {
+	secretD, internalD := item.secretResponse()
+	resp := b.Secret(SecretTypeKey).Response(secretD, internalD)
+	resp.Secret.TTL = ttl
+	resp.Secret.MaxTTL = maxTTL
+	resp.Secret.Renewable = false
+
+	return resp
+}
+
+func getSecretKeyFromCache(ctx context.Context, s logical.Storage, rs *RoleSet) (*serviceAccountKeyCacheItem, error) {
+	cacheCollection, err := getCacheCollection(ctx, s, rs.Name)
+	if err != nil {
+		return nil, errwrap.Wrapf("could not get service account key cache collection: {{err}}", err)
+	}
+
+	if cacheCollection == nil {
+		return nil, nil
+	}
+
+	_, validCacheItem := cacheCollection.getLatestItem(rs.bindingHash())
+	if validCacheItem == nil {
+		return nil, nil
+	}
+
+	validCacheItem.Counter++
+
+	if err := cacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
+		return nil, errwrap.Wrapf("failed to update cache key collection: {{err}}", err)
+	}
+
+	return validCacheItem, nil
+
+}
+
+func createCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, key *iam.ServiceAccountKey, ttl time.Duration) error {
+	now := time.Now()
+
+	cacheTTL := ttl
+	if cacheTTL == 0 {
+		cacheTTL = defaultCacheTTL
+	}
+
+	newCacheItem := &serviceAccountKeyCacheItem{
+		Name:               key.Name,
+		RolesetName:        rs.Name,
+		RolesetBindingHash: rs.bindingHash(),
+		KeyAlgorithm:       key.KeyAlgorithm,
+		PrivateKeyData:     key.PrivateKeyData,
+		KeyType:            key.PrivateKeyType,
+		IssueTime:          now,
+		TTL:                cacheTTL,
+		Counter:            1,
+	}
+
+	newCacheCollection := newServiceAccountKeyCacheCollection()
+
+	if err := newCacheCollection.putItem(key.Name, newCacheItem); err != nil {
+		return errwrap.Wrapf("failed to put new item into cache collection: {{err}}", err)
+	}
+
+	if err := newCacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
+		return errwrap.Wrapf("failed to insert new cache collection into storage: {{err}}", err)
+	}
+
+	return nil
+}
+
+func getCacheCollection(ctx context.Context, s logical.Storage, keyName string) (*serviceAccountKeyCacheCollection, error) {
+	cachedKeyCollection, err := s.Get(ctx, keyName)
+	if err != nil {
+		return nil, err
+	}
+
+	if cachedKeyCollection == nil {
+		return nil, nil
+	}
+
+	decodedCollection := new(serviceAccountKeyCacheCollection)
+	if err := cachedKeyCollection.DecodeJSON(decodedCollection); err != nil {
+		return nil, err
+	}
+
+	return decodedCollection, nil
 }
 
 const pathServiceAccountKeySyn = `Generate an service account private key under a specific role set.`
@@ -232,3 +408,100 @@ would generate service account keys for the "deploy" role set.
 On the backend, each roleset is associated with a service account under
 which secrets/keys are created.
 `
+
+type serviceAccountKeyCacheCollection struct {
+	Items map[string]*serviceAccountKeyCacheItem
+}
+
+func newServiceAccountKeyCacheCollection() *serviceAccountKeyCacheCollection {
+	cacheCollection := new(serviceAccountKeyCacheCollection)
+	cacheCollection.Items = make(map[string]*serviceAccountKeyCacheItem)
+
+	return cacheCollection
+}
+
+func (c *serviceAccountKeyCacheCollection) putItem(itemKey string, item *serviceAccountKeyCacheItem) error {
+	if itemKey == "" {
+		return errors.New("Item key can't be empty")
+	}
+
+	if item == nil {
+		return errors.New("Item can't be nil")
+	}
+
+	c.Items[itemKey] = item
+
+	return nil
+}
+
+func (c *serviceAccountKeyCacheCollection) getLatestItem(rsBindingHash string) (string, *serviceAccountKeyCacheItem) {
+	// Keys element format:
+	// projects/<project_id>/serviceAccounts/vault<shorten_roleset_name>-<timestamp>@<project_id>.iam.gserviceaccount.com/keys/<key_id>
+	// Example:
+	// projects/infrastructure-260106/serviceAccounts/vaulttestproduct-te-1589452997@infrastructure-260106.iam.gserviceaccount.com/keys/471b62bd4b2ea968384f66c4d0fa8f91fbf4c61b
+
+	keys := make([]string, 0, len(c.Items))
+	for k := range c.Items {
+		keys = append(keys, k)
+	}
+
+	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+
+	for _, key := range keys {
+		item := c.Items[key]
+
+		expiration := float64((*item).IssueTime.Unix()) + (*item).TTL.Seconds()
+		now := float64(time.Now().Unix())
+
+		if expiration > now && rsBindingHash == item.RolesetBindingHash {
+			return key, item
+		}
+	}
+
+	return "", nil
+}
+
+func (c *serviceAccountKeyCacheCollection) putToStorage(ctx context.Context, s logical.Storage, collectionName string) error {
+	entry, err := logical.StorageEntryJSON(collectionName, c)
+	if err != nil {
+		return err
+	}
+
+	if err := s.Put(ctx, entry); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *serviceAccountKeyCacheCollection) deleteItem(keyName string) {
+	delete(c.Items, keyName)
+}
+
+type serviceAccountKeyCacheItem struct {
+	Name               string
+	RolesetName        string
+	RolesetBindingHash string
+	PrivateKeyData     string
+	KeyAlgorithm       string
+	KeyType            string
+	IssueTime          time.Time
+	TTL                time.Duration
+	Counter            int
+}
+
+func (i *serviceAccountKeyCacheItem) secretResponse() (data map[string]interface{}, internal map[string]interface{}) {
+	data = map[string]interface{}{
+		"private_key_data": i.PrivateKeyData,
+		"key_algorithm":    i.KeyAlgorithm,
+		"key_type":         i.KeyType,
+	}
+
+	internal = map[string]interface{}{
+		"key_name":          i.Name,
+		"role_set":          i.RolesetName,
+		"role_set_bindings": i.RolesetBindingHash,
+	}
+
+	return
+}
