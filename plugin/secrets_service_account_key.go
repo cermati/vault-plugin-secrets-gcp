@@ -287,7 +287,7 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 	}
 
 	if cacheCreationErr := upsertCacheCollection(ctx, s, rs, key, ttlToUse); cacheCreationErr != nil {
-		baseErrResp := fmt.Sprintf("failed to save the new service account key cache collection: %s;", cacheCreationErr.Error())
+		baseErrResp := fmt.Sprintf("failed to save the new service account key cache collection for role %s: %s;", rs.Name, cacheCreationErr.Error())
 
 		_, err = iamC.Projects.ServiceAccounts.Keys.Delete(key.Name).Do()
 		if err != nil && !isGoogleAccountKeyNotFoundErr(err) {
