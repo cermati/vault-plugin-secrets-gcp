@@ -282,7 +282,7 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	if cacheCreationErr := createCacheCollection(ctx, s, rs, key, ttlToUse); cacheCreationErr != nil {
+	if cacheCreationErr := upsertCacheCollection(ctx, s, rs, key, ttlToUse); cacheCreationErr != nil {
 		baseErrResp := fmt.Sprintf("failed to save the new service account key cache collection: %s;", cacheCreationErr.Error())
 
 		_, err = iamC.Projects.ServiceAccounts.Keys.Delete(key.Name).Do()
@@ -347,7 +347,7 @@ func getSecretKeyFromCache(ctx context.Context, s logical.Storage, rs *RoleSet) 
 
 }
 
-func createCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, key *iam.ServiceAccountKey, ttl time.Duration) error {
+func upsertCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, key *iam.ServiceAccountKey, ttl time.Duration) error {
 	now := time.Now()
 
 	cacheTTL := ttl
@@ -367,21 +367,24 @@ func createCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, 
 		Counter:            1,
 	}
 
-	newCacheCollection := newServiceAccountKeyCacheCollection()
+	cacheCollection, err := getCacheCollection(ctx, s, rs.Name)
+	if err != nil || cacheCollection == nil {
+		cacheCollection = newServiceAccountKeyCacheCollection()
+	}
 
-	if err := newCacheCollection.putItem(key.Name, newCacheItem); err != nil {
+	if err := cacheCollection.putItem(key.Name, newCacheItem); err != nil {
 		return errwrap.Wrapf("failed to put new item into cache collection: {{err}}", err)
 	}
 
-	if err := newCacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
+	if err := cacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
 		return errwrap.Wrapf("failed to insert new cache collection into storage: {{err}}", err)
 	}
 
 	return nil
 }
 
-func getCacheCollection(ctx context.Context, s logical.Storage, keyName string) (*serviceAccountKeyCacheCollection, error) {
-	cachedKeyCollection, err := s.Get(ctx, keyName)
+func getCacheCollection(ctx context.Context, s logical.Storage, rolesetName string) (*serviceAccountKeyCacheCollection, error) {
+	cachedKeyCollection, err := s.Get(ctx, rolesetName)
 	if err != nil {
 		return nil, err
 	}
