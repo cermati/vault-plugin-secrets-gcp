@@ -179,7 +179,11 @@ func (b *backend) secretKeyRevoke(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse(fmt.Sprintf("unable to get service account key cache collection of role %s: %v", rolesetName, err)), nil
 	}
 
-	item := cacheCollection.Items[keyName]
+	item, ok := cacheCollection.Items[keyName]
+	if !ok {
+		return logical.ErrorResponse(fmt.Sprintf("unable to get service account key cache item of key %s: %v", keyName, err)), nil
+	}
+
 	item.Counter--
 
 	if item.Counter == 0 {
@@ -368,7 +372,11 @@ func upsertCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, 
 	}
 
 	cacheCollection, err := getCacheCollection(ctx, s, rs.Name)
-	if err != nil || cacheCollection == nil {
+	if err != nil {
+		return errwrap.Wrapf("failed to retrieve cache collection: {{err}}", err)
+	}
+
+	if cacheCollection == nil {
 		cacheCollection = newServiceAccountKeyCacheCollection()
 	}
 
