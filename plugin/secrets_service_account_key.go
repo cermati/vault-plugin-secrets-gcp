@@ -179,7 +179,11 @@ func (b *backend) secretKeyRevoke(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse(fmt.Sprintf("unable to get service account key cache collection of role %s: %v", rolesetName, err)), nil
 	}
 
-	item := cacheCollection.Items[keyName]
+	item, ok := cacheCollection.Items[keyName]
+	if !ok {
+		return logical.ErrorResponse(fmt.Sprintf("unable to get service account key cache item of key %s: %v", keyName, err)), nil
+	}
+
 	item.Counter--
 
 	if item.Counter == 0 {
@@ -282,8 +286,8 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	if cacheCreationErr := createCacheCollection(ctx, s, rs, key, ttlToUse); cacheCreationErr != nil {
-		baseErrResp := fmt.Sprintf("failed to save the new service account key cache collection: %s;", cacheCreationErr.Error())
+	if cacheCreationErr := upsertCacheCollection(ctx, s, rs, key, ttlToUse); cacheCreationErr != nil {
+		baseErrResp := fmt.Sprintf("failed to save the new service account key cache collection for role %s: %s;", rs.Name, cacheCreationErr.Error())
 
 		_, err = iamC.Projects.ServiceAccounts.Keys.Delete(key.Name).Do()
 		if err != nil && !isGoogleAccountKeyNotFoundErr(err) {
@@ -347,7 +351,7 @@ func getSecretKeyFromCache(ctx context.Context, s logical.Storage, rs *RoleSet) 
 
 }
 
-func createCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, key *iam.ServiceAccountKey, ttl time.Duration) error {
+func upsertCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, key *iam.ServiceAccountKey, ttl time.Duration) error {
 	now := time.Now()
 
 	cacheTTL := ttl
@@ -367,21 +371,28 @@ func createCacheCollection(ctx context.Context, s logical.Storage, rs *RoleSet, 
 		Counter:            1,
 	}
 
-	newCacheCollection := newServiceAccountKeyCacheCollection()
+	cacheCollection, err := getCacheCollection(ctx, s, rs.Name)
+	if err != nil {
+		return errwrap.Wrapf("failed to retrieve cache collection: {{err}}", err)
+	}
 
-	if err := newCacheCollection.putItem(key.Name, newCacheItem); err != nil {
+	if cacheCollection == nil {
+		cacheCollection = newServiceAccountKeyCacheCollection()
+	}
+
+	if err := cacheCollection.putItem(key.Name, newCacheItem); err != nil {
 		return errwrap.Wrapf("failed to put new item into cache collection: {{err}}", err)
 	}
 
-	if err := newCacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
+	if err := cacheCollection.putToStorage(ctx, s, rs.Name); err != nil {
 		return errwrap.Wrapf("failed to insert new cache collection into storage: {{err}}", err)
 	}
 
 	return nil
 }
 
-func getCacheCollection(ctx context.Context, s logical.Storage, keyName string) (*serviceAccountKeyCacheCollection, error) {
-	cachedKeyCollection, err := s.Get(ctx, keyName)
+func getCacheCollection(ctx context.Context, s logical.Storage, rolesetName string) (*serviceAccountKeyCacheCollection, error) {
+	cachedKeyCollection, err := s.Get(ctx, rolesetName)
 	if err != nil {
 		return nil, err
 	}
