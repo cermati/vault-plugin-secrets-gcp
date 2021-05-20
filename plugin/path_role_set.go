@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/go-gcp-common/gcputil"
 	"github.com/hashicorp/vault-plugin-secrets-gcp/plugin/iamutil"
 	"github.com/hashicorp/vault-plugin-secrets-gcp/plugin/util"
 	"github.com/hashicorp/vault/sdk/framework"
@@ -43,6 +44,11 @@ func pathRoleSet(b *backend) *framework.Path {
 			"token_scopes": {
 				Type:        framework.TypeCommaStringSlice,
 				Description: `List of OAuth scopes to assign to credentials generated under this role set`,
+			},
+			"existing_service_account_email": {
+				Type:        framework.TypeString,
+				Description: "Email address of an existing service account to use, instead of generating a new one",
+				Default:     "",
 			},
 		},
 		ExistenceCheck: b.pathRoleSetExistenceCheck("name"),
@@ -152,8 +158,9 @@ func (b *backend) pathRoleSetRead(ctx context.Context, req *logical.Request, d *
 	}
 
 	data := map[string]interface{}{
-		"secret_type": rs.SecretType,
-		"bindings":    rs.Bindings.asOutput(),
+		"secret_type":                  rs.SecretType,
+		"use_existing_service_account": rs.UseExistingServiceAccount,
+		"bindings":                     rs.Bindings.asOutput(),
 	}
 
 	if rs.AccountId != nil {
@@ -188,7 +195,7 @@ func (b *backend) pathRoleSetDelete(ctx context.Context, req *logical.Request, d
 	b.rolesetLock.Lock()
 	defer b.rolesetLock.Unlock()
 
-	if rs.AccountId != nil {
+	if rs.AccountId != nil && !rs.UseExistingServiceAccount {
 		_, err := framework.PutWAL(ctx, req.Storage, walTypeAccount, &walAccount{
 			RoleSet: rsName,
 			Id:      *rs.AccountId,
@@ -239,7 +246,7 @@ func (b *backend) pathRoleSetDelete(ctx context.Context, req *logical.Request, d
 	apiHandle := iamutil.GetApiHandle(httpC, useragent.String())
 
 	warnings := make([]string, 0)
-	if rs.AccountId != nil {
+	if rs.AccountId != nil && !rs.UseExistingServiceAccount {
 		if err := b.deleteTokenGenKey(ctx, iamAdmin, rs.TokenGen); err != nil {
 			w := fmt.Sprintf("unable to delete key under service account %q (WAL entry to clean-up later has been added): %v", rs.AccountId.ResourceName(), err)
 			warnings = append(warnings, w)
@@ -342,26 +349,55 @@ func (b *backend) pathRoleSetCreateUpdate(ctx context.Context, req *logical.Requ
 		}
 	}
 
+	// Existing service account
+	var existingServiceAccountEmail string
+	existingServiceAccountEmailRaw, useExistingServiceAccount := d.GetOk("existing_service_account_email")
+
+	// Conversion between automatically-generated SA roleset and exsting SA
+	// roleset is not allowed
+	if !isCreate && rs.UseExistingServiceAccount != useExistingServiceAccount {
+		return logical.ErrorResponse("cannot change existing service account config for existing roleset"), nil
+	}
+
+	if useExistingServiceAccount {
+		existingServiceAccountEmail = existingServiceAccountEmailRaw.(string)
+
+		rs.UseExistingServiceAccount = true
+		rs.AccountId = &gcputil.ServiceAccountId{
+			Project:   project,
+			EmailOrId: existingServiceAccountEmail,
+		}
+
+		// TODO: check SA exsistence
+		// TODO: check whether updating SA is a good idea
+	}
+
 	// Bindings
 	bRaw, newBindings := d.GetOk("bindings")
-
-	if newBindings {
-		bindings, ok := bRaw.(string)
-		if !ok {
-			return logical.ErrorResponse("bindings are not a string"), nil
+	if useExistingServiceAccount {
+		if newBindings {
+			return logical.ErrorResponse("bindings are not supported for static service account"), nil
 		}
-		if bindings == "" {
-			return logical.ErrorResponse("bindings are empty"), nil
+	} else {
+		if newBindings {
+			bindings, ok := bRaw.(string)
+			if !ok {
+				return logical.ErrorResponse("bindings are not a string"), nil
+			}
+			if bindings == "" {
+				return logical.ErrorResponse("bindings are empty"), nil
+			}
+		}
+
+		if isCreate && !newBindings {
+			return logical.ErrorResponse("bindings are required for new role set"), nil
 		}
 	}
 
-	if isCreate && !newBindings {
-		return logical.ErrorResponse("bindings are required for new role set"), nil
-	}
-
-	// If no new bindings or new bindings are exactly same as old bindings,
-	// just update the role set without rotating service account.
-	if !newBindings || rs.bindingHash() == getStringHash(bRaw.(string)) {
+	// If no new bindings, new bindings are exactly same as old bindings, or
+	// using an exsting service account, just update the role set without rotating
+	// service account.
+	if !newBindings || rs.bindingHash() == getStringHash(bRaw.(string)) || useExistingServiceAccount {
 		if rs.TokenGen != nil {
 			rs.TokenGen.Scopes = scopes
 		}
@@ -416,6 +452,16 @@ func (b *backend) pathRoleSetRotateAccount(ctx context.Context, req *logical.Req
 	}
 	if rs == nil {
 		return logical.ErrorResponse(fmt.Sprintf("roleset '%s' not found", name)), nil
+	}
+
+	if rs.UseExistingServiceAccount {
+		return logical.ErrorResponse(
+			fmt.Sprintf(
+				"roleset '%s' is using an existing service account '%s', and thus cannot be rotated",
+				name,
+				rs.AccountId.EmailOrId,
+			),
+		), nil
 	}
 
 	var scopes []string
