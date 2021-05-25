@@ -274,6 +274,12 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 
 	account, err := rs.getServiceAccount(iamC)
 	if err != nil {
+		if rs.UseStaticServiceAccount {
+			return logical.ErrorResponse(
+				fmt.Sprintf("roleset '%s' is using a static service account '%s' that has been deleted", rs.Name, rs.AccountId.EmailOrId),
+			), nil
+		}
+
 		return logical.ErrorResponse(fmt.Sprintf("roleset service account was removed - role set must be updated (write to roleset/%s/rotate) before generating new secrets", rs.Name)), nil
 	}
 

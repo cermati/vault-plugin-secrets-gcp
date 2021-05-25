@@ -30,7 +30,7 @@ type RoleSet struct {
 	Name       string
 	SecretType string
 
-	UseExistingServiceAccount bool
+	UseStaticServiceAccount bool
 
 	RawBindings string
 	Bindings    ResourceBindings
@@ -53,17 +53,17 @@ func (rs *RoleSet) validate() error {
 		err = multierror.Append(err, fmt.Errorf("role set should have account associated"))
 	}
 
-	if rs.UseExistingServiceAccount {
+	if rs.UseStaticServiceAccount {
 		if rs.AccountId.EmailOrId == "" || rs.AccountId.Project == "" {
 			err = multierror.Append(err, fmt.Errorf("role set should have service account & project associated"))
 		}
 
 		if len(rs.Bindings) != 0 {
-			err = multierror.Append(err, fmt.Errorf("role set bindings must be empty when using existing service account"))
+			err = multierror.Append(err, fmt.Errorf("role set bindings must be empty when using static service account"))
 		}
 
 		if len(rs.RawBindings) != 0 {
-			err = multierror.Append(err, fmt.Errorf("role set raw bindings must be empty string when using existing service account"))
+			err = multierror.Append(err, fmt.Errorf("role set raw bindings must be empty string when using static service account"))
 		}
 	} else {
 		if len(rs.Bindings) == 0 {
@@ -143,9 +143,10 @@ func (b *backend) saveRoleSetWithNewAccount(ctx context.Context, s logical.Stora
 	b.rolesetLock.Lock()
 	defer b.rolesetLock.Unlock()
 
-	if rs.UseExistingServiceAccount {
+	if rs.UseStaticServiceAccount {
 		return nil, fmt.Errorf(
-			"roleset '%s' is using an existing service account, cannot save with new account",
+			"roleset '%s' is using an static service account, cannot "+
+				"save changes into a new service account",
 			rs.Name,
 		)
 	}
