@@ -250,7 +250,15 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 		ttlToUse = time.Duration(ttl) * time.Second
 	}
 
-	cachedSAK, err := sakcache.GetKeyByBindingHash(ctx, s, rs.Name, rs.bindingHash())
+	var cachedSAK *sakcache.CacheItem = nil
+
+	if !rs.UseStaticServiceAccount {
+		cachedSAK, err = sakcache.GetKeyByBindingHash(ctx, s, rs.Name, rs.bindingHash())
+	} else {
+		// Static service account rolesets have empty binding, use service account
+		// email instead
+		cachedSAK, err = sakcache.GetKeyByServiceAccountEmail(ctx, s, rs.Name, rs.AccountId.EmailOrId)
+	}
 	if err != nil {
 		b.Logger().Error("failed to get service account key from cache", "roleset_name", rs.Name, "err", err.Error())
 	}
@@ -281,6 +289,12 @@ func (b *backend) getSecretKey(ctx context.Context, s logical.Storage, rs *RoleS
 
 	account, err := rs.getServiceAccount(iamC)
 	if err != nil {
+		if rs.UseStaticServiceAccount {
+			return logical.ErrorResponse(
+				fmt.Sprintf("roleset '%s' is using a static service account '%s' that has been deleted", rs.Name, rs.AccountId.EmailOrId),
+			), nil
+		}
+
 		return logical.ErrorResponse(fmt.Sprintf("roleset service account was removed - role set must be updated (write to roleset/%s/rotate) before generating new secrets", rs.Name)), nil
 	}
 

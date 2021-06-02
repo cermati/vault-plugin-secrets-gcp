@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/mitchellh/mapstructure"
@@ -49,6 +50,42 @@ func (b *backend) serviceAccountKeyCacheRollback(ctx context.Context, req *logic
 	)
 
 	return nil
+}
+
+// rollbackAllCachedServiceAccountKeys deletes all service account keys created
+// for a roleset
+func rollbackAllCachedServiceAccountKeys(
+	ctx context.Context,
+	s logical.Storage,
+	iamC *iam.Service,
+	rolesetName string,
+) *multierror.Error {
+	var merr *multierror.Error
+
+	cachedKeys, err := sakcache.GetAllKeys(ctx, s, rolesetName)
+	if err != nil {
+		merr = multierror.Append(
+			merr,
+			errwrap.Wrapf("unable to fetch service account keys used by the roleset, rollback aborted: {{err}}", err),
+		)
+
+		return merr
+	}
+
+	for _, cachedKey := range cachedKeys {
+		err := rollbackCachedServiceAccountKey(ctx, s, iamC, rolesetName, cachedKey.Name)
+		if err != nil {
+			merr = multierror.Append(
+				merr,
+				errwrap.Wrapf(
+					fmt.Sprintf("unable to successfully rollback key '%s': {{err}}", cachedKey.Name),
+					err,
+				),
+			)
+		}
+	}
+
+	return merr
 }
 
 // rollbackCachedServiceAccountKey should be called on creation of a new SAK
