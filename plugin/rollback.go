@@ -21,6 +21,8 @@ const (
 	walTypeAccount    = "account"
 	walTypeAccountKey = "account_key"
 	walTypeIamPolicy  = "iam_policy"
+
+	walTypeAccountKeyCache = "account_key_cache"
 )
 
 func (b *backend) walRollback(ctx context.Context, req *logical.Request, kind string, data interface{}) error {
@@ -31,6 +33,8 @@ func (b *backend) walRollback(ctx context.Context, req *logical.Request, kind st
 		return b.serviceAccountKeyRollback(ctx, req, data)
 	case walTypeIamPolicy:
 		return b.serviceAccountPolicyRollback(ctx, req, data)
+	case walTypeAccountKeyCache:
+		return b.serviceAccountKeyCacheRollback(ctx, req, data)
 	default:
 		return fmt.Errorf("unknown type to rollback")
 	}

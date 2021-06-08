@@ -36,8 +36,6 @@ type backend struct {
 	resources iamutil.ResourceParser
 
 	rolesetLock sync.Mutex
-
-	saCacheLock sync.Mutex
 }
 
 // Factory returns a new backend as logical.Backend.
@@ -87,6 +85,11 @@ func Backend() *backend {
 		Invalidate:        b.invalidate,
 		WALRollback:       b.walRollback,
 		WALRollbackMinAge: 5 * time.Minute,
+
+		// Will be triggered every ~1m
+		PeriodicFunc: func(ctx context.Context, req *logical.Request) error {
+			return RunAllWorker(b, ctx, req)
+		},
 	}
 
 	return b
