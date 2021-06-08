@@ -30,6 +30,8 @@ type RoleSet struct {
 	Name       string
 	SecretType string
 
+	UseStaticServiceAccount bool
+
 	RawBindings string
 	Bindings    ResourceBindings
 
@@ -51,12 +53,26 @@ func (rs *RoleSet) validate() error {
 		err = multierror.Append(err, fmt.Errorf("role set should have account associated"))
 	}
 
-	if len(rs.Bindings) == 0 {
-		err = multierror.Append(err, fmt.Errorf("role set bindings cannot be empty"))
-	}
+	if rs.UseStaticServiceAccount {
+		if rs.AccountId.EmailOrId == "" || rs.AccountId.Project == "" {
+			err = multierror.Append(err, fmt.Errorf("role set should have service account & project associated when using static service account"))
+		}
 
-	if len(rs.RawBindings) == 0 {
-		err = multierror.Append(err, fmt.Errorf("role set raw bindings cannot be empty string"))
+		if len(rs.Bindings) != 0 {
+			err = multierror.Append(err, fmt.Errorf("role set bindings must be empty when using static service account"))
+		}
+
+		if len(rs.RawBindings) != 0 {
+			err = multierror.Append(err, fmt.Errorf("role set raw bindings must be empty string when using static service account"))
+		}
+	} else {
+		if len(rs.Bindings) == 0 {
+			err = multierror.Append(err, fmt.Errorf("role set bindings cannot be empty"))
+		}
+
+		if len(rs.RawBindings) == 0 {
+			err = multierror.Append(err, fmt.Errorf("role set raw bindings cannot be empty string"))
+		}
 	}
 
 	switch rs.SecretType {
@@ -126,6 +142,14 @@ type TokenGenerator struct {
 func (b *backend) saveRoleSetWithNewAccount(ctx context.Context, s logical.Storage, rs *RoleSet, project string, newBinds ResourceBindings, scopes []string) (warning []string, err error) {
 	b.rolesetLock.Lock()
 	defer b.rolesetLock.Unlock()
+
+	if rs.UseStaticServiceAccount {
+		return nil, fmt.Errorf(
+			"roleset '%s' is using an static service account, cannot "+
+				"save changes into a new service account",
+			rs.Name,
+		)
+	}
 
 	httpC, err := b.HTTPClient(s)
 	if err != nil {

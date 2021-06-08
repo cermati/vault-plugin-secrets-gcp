@@ -163,6 +163,51 @@ func GetKeyByBindingHash(
 	return validCacheItem, nil
 }
 
+// GetKeyByServiceAccountEmail fetches the latest SAK for a roleset from cache
+// by its email address.
+//
+// Please note that if the value returned by this function is returned to Vault,
+// the UseKey() function must also be called.
+func GetKeyByServiceAccountEmail(
+	ctx context.Context,
+	s logical.Storage,
+	rolesetName string,
+	serviceAccountEmail string,
+) (key *CacheItem, err error) {
+	saCacheLock.Lock()
+	defer saCacheLock.Unlock()
+
+	cacheCollection, err := getCacheCollection(ctx, s, rolesetName)
+	if err != nil {
+		return nil, errwrap.Wrapf("could not get service account key cache collection: {{err}}", err)
+	}
+
+	if cacheCollection == nil {
+		return nil, nil
+	}
+
+	_, validCacheItem := cacheCollection.GetLatestItemByServiceAccountEmail(serviceAccountEmail)
+	if validCacheItem == nil {
+		return nil, nil
+	}
+
+	return validCacheItem, nil
+}
+
+// GetAllKeys returns all keys used by a roleset
+func GetAllKeys(
+	ctx context.Context,
+	s logical.Storage,
+	rolesetName string,
+) (map[string]*CacheItem, error) {
+	cacheCollection, err := getCacheCollection(ctx, s, rolesetName)
+	if err != nil {
+		return nil, err
+	}
+
+	return cacheCollection.Items, nil
+}
+
 // UseKey increments a cached SAK's reference counter. To be called when the key
 // is returned to Vault to be used in a lease.
 func UseKey(

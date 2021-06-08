@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/go-gcp-common/gcputil"
 	"github.com/hashicorp/vault-plugin-secrets-gcp/plugin/iamutil"
 	"github.com/hashicorp/vault-plugin-secrets-gcp/plugin/util"
 	"github.com/hashicorp/vault/sdk/framework"
@@ -43,6 +44,12 @@ func pathRoleSet(b *backend) *framework.Path {
 			"token_scopes": {
 				Type:        framework.TypeCommaStringSlice,
 				Description: `List of OAuth scopes to assign to credentials generated under this role set`,
+			},
+			"static_service_account_email": {
+				Type: framework.TypeString,
+				Description: "Email address of an existing service account to use when generating service " +
+					"account keys, as opposed to let the plugin generate a new service account",
+				Default: "",
 			},
 		},
 		ExistenceCheck: b.pathRoleSetExistenceCheck("name"),
@@ -152,8 +159,9 @@ func (b *backend) pathRoleSetRead(ctx context.Context, req *logical.Request, d *
 	}
 
 	data := map[string]interface{}{
-		"secret_type": rs.SecretType,
-		"bindings":    rs.Bindings.asOutput(),
+		"secret_type":                rs.SecretType,
+		"use_static_service_account": rs.UseStaticServiceAccount,
+		"bindings":                   rs.Bindings.asOutput(),
 	}
 
 	if rs.AccountId != nil {
@@ -188,7 +196,9 @@ func (b *backend) pathRoleSetDelete(ctx context.Context, req *logical.Request, d
 	b.rolesetLock.Lock()
 	defer b.rolesetLock.Unlock()
 
-	if rs.AccountId != nil {
+	// Using "dynamic" service accounts, set up WALs to delete all created
+	// resources. WALs for static SA will be created later.
+	if rs.AccountId != nil && !rs.UseStaticServiceAccount {
 		_, err := framework.PutWAL(ctx, req.Storage, walTypeAccount, &walAccount{
 			RoleSet: rsName,
 			Id:      *rs.AccountId,
@@ -239,7 +249,9 @@ func (b *backend) pathRoleSetDelete(ctx context.Context, req *logical.Request, d
 	apiHandle := iamutil.GetApiHandle(httpC, useragent.String())
 
 	warnings := make([]string, 0)
-	if rs.AccountId != nil {
+
+	// Using "dynamic" service accounts, attempt to delete resources
+	if rs.AccountId != nil && !rs.UseStaticServiceAccount {
 		if err := b.deleteTokenGenKey(ctx, iamAdmin, rs.TokenGen); err != nil {
 			w := fmt.Sprintf("unable to delete key under service account %q (WAL entry to clean-up later has been added): %v", rs.AccountId.ResourceName(), err)
 			warnings = append(warnings, w)
@@ -254,6 +266,22 @@ func (b *backend) pathRoleSetDelete(ctx context.Context, req *logical.Request, d
 			for _, err := range merr.Errors {
 				w := fmt.Sprintf("unable to delete IAM policy bindings for service account %q (WAL entry to clean-up later has been added): %v", rs.AccountId.EmailOrId, err)
 				warnings = append(warnings, w)
+			}
+		}
+	}
+
+	// Using static service account, delete all created keys. Errors can be safely
+	// ignored because of WAL entries created by rollbackAllCachedServiceAccountKeys(),
+	// and the fact that even if an error occurred during WAL write, the leases
+	// still exist and will be revoked by Vault.
+	if rs.AccountId != nil && rs.UseStaticServiceAccount {
+		merr := rollbackAllCachedServiceAccountKeys(ctx, req.Storage, iamAdmin, rs.Name)
+		if merr != nil {
+			for _, err := range merr.Errors {
+				warnings = append(
+					warnings,
+					fmt.Sprintf("unable to delete static service account key from roleset '%s' (WAL entry to clean-up later has been added): %v", rs.Name, err),
+				)
 			}
 		}
 	}
@@ -342,26 +370,70 @@ func (b *backend) pathRoleSetCreateUpdate(ctx context.Context, req *logical.Requ
 		}
 	}
 
+	// Static service account
+	var staticServiceAccountEmail string
+	staticServiceAccountEmailRaw, useStaticServiceAccount := d.GetOk("static_service_account_email")
+
+	// Conversion between automatically-generated SA roleset and static SA
+	// roleset is not allowed
+	if !isCreate && rs.UseStaticServiceAccount != useStaticServiceAccount {
+		return logical.ErrorResponse("cannot convert existing roleset to use a static service account"), nil
+	}
+
+	if useStaticServiceAccount {
+		staticServiceAccountEmail = staticServiceAccountEmailRaw.(string)
+
+		// Assign static service account
+		rs.UseStaticServiceAccount = true
+		rs.AccountId = &gcputil.ServiceAccountId{
+			Project:   project,
+			EmailOrId: staticServiceAccountEmail,
+		}
+
+		// Check that the static SA exists
+		iamC, err := b.IAMAdminClient(req.Storage)
+		if err != nil {
+			return nil, errwrap.Wrapf("could not create IAM Admin client: {{err}}", err)
+		}
+
+		account, err := rs.getServiceAccount(iamC)
+		if err != nil || account == nil {
+			return logical.ErrorResponse(
+				fmt.Sprintf(
+					"static service account '%s' does not exist: %s",
+					rs.AccountId.ResourceName(),
+					err.Error(),
+				),
+			), nil
+		}
+	}
+
 	// Bindings
 	bRaw, newBindings := d.GetOk("bindings")
-
-	if newBindings {
-		bindings, ok := bRaw.(string)
-		if !ok {
-			return logical.ErrorResponse("bindings are not a string"), nil
+	if useStaticServiceAccount {
+		if newBindings {
+			return logical.ErrorResponse("bindings are not supported for static service account"), nil
 		}
-		if bindings == "" {
-			return logical.ErrorResponse("bindings are empty"), nil
+	} else {
+		if newBindings {
+			bindings, ok := bRaw.(string)
+			if !ok {
+				return logical.ErrorResponse("bindings are not a string"), nil
+			}
+			if bindings == "" {
+				return logical.ErrorResponse("bindings are empty"), nil
+			}
+		}
+
+		if isCreate && !newBindings {
+			return logical.ErrorResponse("bindings are required for new role set"), nil
 		}
 	}
 
-	if isCreate && !newBindings {
-		return logical.ErrorResponse("bindings are required for new role set"), nil
-	}
-
-	// If no new bindings or new bindings are exactly same as old bindings,
-	// just update the role set without rotating service account.
-	if !newBindings || rs.bindingHash() == getStringHash(bRaw.(string)) {
+	// If no new bindings, new bindings are exactly same as old bindings, or
+	// using a static service account, just update the role set without rotating
+	// service account.
+	if !newBindings || rs.bindingHash() == getStringHash(bRaw.(string)) || useStaticServiceAccount {
 		if rs.TokenGen != nil {
 			rs.TokenGen.Scopes = scopes
 		}
@@ -416,6 +488,16 @@ func (b *backend) pathRoleSetRotateAccount(ctx context.Context, req *logical.Req
 	}
 	if rs == nil {
 		return logical.ErrorResponse(fmt.Sprintf("roleset '%s' not found", name)), nil
+	}
+
+	if rs.UseStaticServiceAccount {
+		return logical.ErrorResponse(
+			fmt.Sprintf(
+				"roleset '%s' is using a static service account '%s', and thus cannot be rotated",
+				name,
+				rs.AccountId.EmailOrId,
+			),
+		), nil
 	}
 
 	var scopes []string
