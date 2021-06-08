@@ -55,7 +55,7 @@ func (rs *RoleSet) validate() error {
 
 	if rs.UseStaticServiceAccount {
 		if rs.AccountId.EmailOrId == "" || rs.AccountId.Project == "" {
-			err = multierror.Append(err, fmt.Errorf("role set should have service account & project associated"))
+			err = multierror.Append(err, fmt.Errorf("role set should have service account & project associated when using static service account"))
 		}
 
 		if len(rs.Bindings) != 0 {
